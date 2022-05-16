@@ -1,0 +1,334 @@
+/////////////////实现双目测距//////////////////////////
+#include <opencv2/opencv.hpp>  
+#include <vector>  
+#include <string>  
+#include <algorithm>  
+#include <iostream>  
+#include <iterator>  
+#include <stdio.h>  
+#include <stdlib.h>  
+#include <ctype.h>   
+#include <cv.hpp>  
+# pragma warning(disable:4996) //close security check
+
+using namespace std;
+using namespace cv;
+
+Rect validROIL, validROIR;//图像校正之后，会对图像进行裁剪，这里的validROI就是指裁剪之后的区域 
+								                     
+//把双目标定后得到的校正参数给写上
+Mat R = (Mat_<double>(3, 3) << 9.9931394947414043e-01, -1.9770087298089413e-03,
+	3.6982723302608309e-02, 1.9191404883380906e-03,
+	9.9999687817073057e-01, 1.6001714217779447e-03,
+	-3.6985771401730289e-02, -1.5280985816735291e-03,
+	9.9931462394410286e-01);
+Mat T = (Mat_<double>(3, 1) << -6.0958273927423541e+01, -2.7912322587203775e-01,
+       -3.8282881724735657e-0); //校正平移矩阵T
+Mat cameraMatrixL = (Mat_<double>(3, 3)
+	<< 3.5942725637922354e+03, 0., 1.0194281912248358e+03, 0.,
+       3.6121383350218048e+03, 5.6155677532387017e+02, 0., 0., 1.);
+Mat distCoeffL = (Mat_<double>(5, 1)
+	<< 6.3081287729754409e-01, -1.5839893246618240e+01,
+	7.0681553099107538e-03, -1.0593983307986962e-02,
+	1.6334664383505694e+02);
+Mat cameraMatrixR = (Mat_<double>(3, 3) << 3.6455956302042237e+03, 0., 8.8531615161802154e+02, 0.,
+	3.6504072464595642e+03, 5.4632542200493299e+02, 0., 0., 1.);
+Mat distCoeffR = (Mat_<double>(5, 1) << 6.7613315569579846e-01, -1.8039547187028326e+01,
+	3.9408622346729797e-03, 1.5847448888154366e-02,
+	1.8817084778307191e+02);
+Mat Rl, Rr, Pl, Pr, Q;
+Mat mapLx, mapLy, mapRx, mapRy;//映射表  
+Mat sgbm_disp, bm_disp, sgbm_depth, bm_depth, draw1, draw2, sgbm_xyz, bm_xyz, xyz1, xyz2;
+Point origin;
+Rect selection;
+bool selectObject = false;
+Rect vaildROIL;
+Rect vaildROIR;//图像校正后，会对图像进行裁剪，这里的vaildROIR就是指裁剪之后的区域
+
+int blockSize = 0, uniquenessRatio = 0, numDisparities = 0;
+Ptr<StereoBM>bm = StereoBM::create();//定义BM参数 局部匹配
+int mindisparity = 0;
+int ndisparities = 64;
+int SADWindowSize = 11;
+
+Mat rectifyImageL, rectifyImageR;
+
+void outputCameraParam(void) //保存参数函数
+{
+	/*保存数据*/
+	/*输出数据*/
+	FileStorage fs("intrinsics.yml", FileStorage::WRITE);  //文件存储器的初始化
+	if (fs.isOpened())
+	{
+		fs << "cameraMatrixL" << cameraMatrixL << "cameraDistcoeffL" << distCoeffL << "cameraMatrixR" << cameraMatrixR << "cameraDistcoeffR" << distCoeffR;
+		fs.release();
+		cout << "cameraMatrixL=:" << cameraMatrixL << endl << "cameraDistcoeffL=:" << distCoeffL << endl << "cameraMatrixR=:" << cameraMatrixR << endl << "cameraDistcoeffR=:" << distCoeffR << endl;
+	}
+	else
+	{
+		cout << "Error: can not save the intrinsics!!!!!" << endl;
+	}
+	fs.open("extrinsics.yml", FileStorage::WRITE);
+
+	if (fs.isOpened())
+	{
+		fs << "R" << R << "T" << T << "Rl" << Rl << "Rr" << Rr << "Pl" << Pl << "Pr" << Pr << "Q" << Q;
+		cout << "R=" << R << endl << "T=" << T << endl << "Rl=" << Rl << endl << "Rr=" << Rr << endl << "Pl=" << Pl << endl << "Pr=" << Pr << endl << "Q=" << Q << endl;
+		fs.release();
+	}
+	else
+		cout << "Error: can not save the extrinsic parameters\n";
+}
+
+void stereo_match(int, void*)//BM算法匹配
+{
+	bm->setBlockSize(2 * blockSize + 5);//SAD窗口大小 5-21最适宜
+	bm->setROI1(vaildROIL);
+	bm->setROI2(vaildROIR);
+	bm->setPreFilterCap(31);
+	bm->setMinDisparity(0);//最小视差，默认值为0, 可以是负值，int型
+	bm->setNumDisparities(numDisparities * 16 + 16);//视差窗口，即最大视差值与最小视差值之差,窗口大小必须是16的整数倍，int型 
+	bm->setTextureThreshold(10);
+	bm->setUniquenessRatio(uniquenessRatio);//可以防止误匹配
+	bm->setSpeckleWindowSize(100);
+	bm->setSpeckleRange(32);
+	bm->setDisp12MaxDiff(-1);
+	Mat disp, disp8;
+	//输入图像必须为灰度图
+	bm->compute(rectifyImageL, rectifyImageR, disp);//生成视差图
+	disp.convertTo(disp8, CV_8U, 255 / ((numDisparities * 16 + 16) * 16.));//计算出的视差是CV_16S格式,将其转化为CV_8U的形式
+	reprojectImageTo3D(disp, bm_xyz, Q);
+	xyz1 = bm_xyz * 16;//在实际求距离时，ReprojectTo3D出来的X / W, Y / W, Z / W都要乘以16(也就是W除以16)，才能得到正确的三维坐标信息。
+	imshow("disparity_bm", disp8);
+	cout << "  stereo_match successful" << endl;
+}
+
+void stereo_sgbm_match(int, void*) //SGBM算法匹配
+{
+	int mindisparity = 0;
+	int ndisparities = 64;
+	int SADWindowSize = 11;
+	cv::Ptr<cv::StereoSGBM> sgbm = cv::StereoSGBM::create(mindisparity, ndisparities, SADWindowSize);
+	int p1 = 8 * rectifyImageL.channels() * SADWindowSize* SADWindowSize;
+	int p2 = 32 * rectifyImageL.channels() * SADWindowSize* SADWindowSize;
+	sgbm->setP1(p1);
+	sgbm->setP2(p2);
+	sgbm->setPreFilterCap(15);
+	sgbm->setUniquenessRatio(10);
+	sgbm->setSpeckleRange(2);
+	sgbm->setSpeckleWindowSize(100);
+	sgbm->setDisp12MaxDiff(1);
+	//sgbm->setnumdisparities(1);
+	sgbm->setMode(StereoSGBM::MODE_HH);
+	Mat disp, disp8u;
+	sgbm->compute(rectifyImageL, rectifyImageR, disp);
+	disp.convertTo(disp, CV_32F, 1.0 / 16);                //除以16得到真实视差值
+	disp8u = Mat(disp.rows, disp.cols, CV_8UC1);       //显示
+	//normalize(disp, disp8u, 0, 255, norm_minmax, cv_8uc1);
+	disp.convertTo(disp8u, CV_8U, 255 / (numDisparities*16.));
+	reprojectImageTo3D(disp, sgbm_xyz, Q);
+	xyz2 = sgbm_xyz * 16;
+	imshow("disparity_sgbm", disp8u);
+	cout << "  stereo_sgbm_match successful" << endl;
+}
+
+void disp2depth(cv::Mat dispmap, cv::Mat &depthmap)//由视差图计算深度
+{
+
+	Mat cameramatrixl = (Mat_<double>(3, 3) << 7.9171742025888498e+03, 0., 1.0591772180802798e+03, 0.,
+		7.5665769030938263e+03, 3.4906818375184952e+02, 0., 0., 1.);
+	double fx = cameramatrixl.at<double>(0, 0);
+	double fy = cameramatrixl.at<double>(1, 1);
+	double cx = cameramatrixl.at<double>(0, 2);
+	double cy = cameramatrixl.at<double>(1, 2);
+
+	double baseline = 60; //基线距离60mm
+
+	int height = dispmap.rows;
+	int width = dispmap.cols;
+	depthmap.create(height, width, CV_16U);
+
+	//这里深度图的数据类型可能会不一样，大家根据自己的情况进行修改
+	short* dispdata = (short*)dispmap.data;
+	ushort* depthdata = (ushort*)depthmap.data;
+
+	for (int i = 0; i < height; i++)
+	{
+		for (int j = 0; j < width; j++)
+		{
+			int id = i * width + j;
+			if (!dispdata[id])  continue;  //防止0除
+			depthdata[id] = ushort((double)fx*baseline / dispdata[id]);
+		}
+	}
+}
+
+static void onMouse1(int event, int x, int y, int, void*)//描述：鼠标操作回调1
+{
+	if (selectObject)
+	{
+		selection.x = MIN(x, origin.x);
+		selection.y = MIN(y, origin.y);
+		selection.width = std::abs(x - origin.x);
+		selection.height = std::abs(y - origin.y);
+	}
+
+	switch (event)
+	{
+	case EVENT_LBUTTONDOWN:   //鼠标左按钮按下的事件
+		origin = Point(x, y);
+		selection = Rect(x, y, 0, 0);
+		selectObject = true;
+		cout << origin << "由BM算法获得的世界坐标为：\n" << xyz1.at<Vec3f>(origin) << endl;
+		break;
+	case EVENT_LBUTTONUP:    //鼠标左按钮释放的事件
+		selectObject = false;
+		if (selection.width > 0 && selection.height > 0)
+			break;
+	}
+}
+
+static void onMouse2(int event, int x, int y, int, void*)//描述：鼠标操作回调2
+{
+	if (selectObject)
+	{
+		selection.x = MIN(x, origin.x);
+		selection.y = MIN(y, origin.y);
+		selection.width = std::abs(x - origin.x);
+		selection.height = std::abs(y - origin.y);
+	}
+
+	switch (event)
+	{
+	case EVENT_LBUTTONDOWN:   //鼠标左按钮按下的事件
+		origin = Point(x, y);
+		selection = Rect(x, y, 0, 0);
+		selectObject = true;
+		cout << origin << "由SGBM算法获得的世界坐标为：\n " << xyz2.at<Vec3f>(origin) << endl;
+		break;
+	case EVENT_LBUTTONUP:    //鼠标左按钮释放的事件
+		selectObject = false;
+		if (selection.width > 0 && selection.height > 0)
+			break;
+	}
+}
+
+int main()
+{
+	Mat BGRImageL, BGRImageR;
+	Mat rgbImageL, grayImageL;
+	Mat rgbImageR, grayImageR;
+
+	//读取图像
+	BGRImageL = imread("left4.BMP", IMREAD_UNCHANGED);
+	BGRImageR = imread("right4.BMP", IMREAD_UNCHANGED);
+
+	//转为灰度图像显示
+	cvtColor(BGRImageL, grayImageL, COLOR_BGR2GRAY);
+	cvtColor(BGRImageR, grayImageR, COLOR_BGR2GRAY);
+	namedWindow("Rectify BeforeL", CV_WINDOW_NORMAL);
+	imshow("Rectify BeforeL", grayImageL);
+	namedWindow("Rectify BeforeR", CV_WINDOW_NORMAL);
+	imshow("Rectify BeforeR", grayImageR);
+
+	Size imageSize;
+	imageSize.width = 1920;
+	imageSize.height = 1080;
+	                                                  
+
+	/*根据stereoRectify 计算出来的RlRr 和 PlPr 来计算图像的映射表 mapx,mapy
+	mapx,mapy这两个映射表接下来可以给remap()函数调用，来校正图像，使得两幅图像共面并且行对准
+	ininUndistortRectifyMap()的参数newCameraMatrix就是校正后的摄像机矩阵。在openCV里面，校正后的计算机矩阵Mrect是跟投影矩阵P一起返回的。
+	所以我们在这里传入投影矩阵P，此函数可以从投影矩阵P中读出校正后的摄像机矩阵
+	*/
+	stereoRectify(cameraMatrixL, distCoeffL, cameraMatrixR, distCoeffR, imageSize, R, T, Rl, Rr, Pl, Pr, Q, CALIB_ZERO_DISPARITY, -1, imageSize, &validROIL, &validROIR);
+	waitKey(10);
+	//摄像机校正映射 两种方法 initUndistortRectifyMap+rmap 或者undistort
+	
+	////////////////////////////////法1//////////////////////////////
+	/*undistort(BGRImageL, rectifyImageL, distCoeffL, cameraMatrixL);
+	undistort(BGRImageR, rectifyImageR, distCoeffR, cameraMatrixR);
+	*/
+	////////////////////////////////法2//////////////////////////////
+	//经过initUndistortRectifyMap之后
+	initUndistortRectifyMap(cameraMatrixL, distCoeffL, Rl, Pl, imageSize, CV_32FC1, mapLx, mapLy);
+	initUndistortRectifyMap(cameraMatrixR, distCoeffR, Rr, Pr, imageSize, CV_32FC1, mapRx, mapRy);
+	cout << " UndistortRectifyMap successful" << endl;
+
+	//再经过remap，左右相机的图像已经共面并且行对准了
+
+	remap(BGRImageL, rectifyImageL, mapLx, mapLy, INTER_LINEAR);
+	remap(BGRImageR, rectifyImageR, mapRx, mapRy, INTER_LINEAR);
+
+	namedWindow("rectifyImageL", CV_WINDOW_NORMAL);
+	imshow("rectifyImageL", rectifyImageL);
+	namedWindow("rectifyImageR", CV_WINDOW_NORMAL);
+	imshow("rectifyImageR", rectifyImageR);
+	cout << " Remap successful" << endl;
+	
+
+	/*
+	把校正结果显示出来
+	把左右两幅图像显示到同一个画面上
+	这里只显示了左右的最后一副图像的校正结果。并没有把所有的图像都显示出来
+	*/
+	Mat canvas;
+	double sf;
+	int w, h;
+	sf = 600. / MAX(imageSize.width, imageSize.height);
+	w = cvRound(imageSize.width * sf);
+	h = cvRound(imageSize.height * sf);
+	canvas.create(h, w * 2, CV_8UC3);
+	//左图像画到画布上
+	Mat canvasPart = canvas(Rect(0, 0, w, h));
+	resize(rectifyImageL, canvasPart, canvasPart.size(), 0, 0, INTER_AREA);
+	Rect vroiL(cvRound(validROIL.x*sf), cvRound(validROIL.y*sf),
+		cvRound(validROIL.width*sf), cvRound(validROIL.height*sf));
+	rectangle(canvasPart, vroiL, Scalar(0, 0, 255), 3, 8);
+	cout << "Painted ImageL" << endl;
+	//右图像画到画布上
+	canvasPart = canvas(Rect(w, 0, w, h));
+	resize(rectifyImageR, canvasPart, canvasPart.size(), 0, 0, INTER_LINEAR);
+	Rect vroiR(cvRound(validROIR.x*sf), cvRound(validROIR.y*sf),
+		cvRound(validROIR.width*sf), cvRound(validROIR.height*sf));
+	rectangle(canvasPart, vroiR, Scalar(0, 255, 0), 3, 8);
+	cout << "Painted ImageR" << endl;
+	//画上对应的线条
+	for (int i = 0; i < canvas.rows; i += 16)
+		line(canvas, Point(0, i), Point(canvas.cols, i), Scalar(0, 255, 0), 1, 8);
+	imshow("rectified", canvas);
+	cout << "wait key" << endl;
+	return 0;
+
+	cout << "display successful" << endl;
+	//*保存并输出数据*/
+	outputCameraParam();
+
+	///////////////////////////////BM算法得到视差图+Z轴位置//////////////////////////////
+	namedWindow("disparity_bm", CV_NORMAL);
+	//滑轨响应函数createTrackbar(滑轨名, 依附图像, 函数变量地址指针，最大变值,作用函数，一般取0)
+	getTrackbarPos("NumDisparities:\n", "disparity_bm");
+	createTrackbar("NumDisparities:\n", "disparity_bm", &numDisparities, 16, stereo_match, 0);
+	getTrackbarPos("UniquenessRatio:\n", "disparity_bm");
+	createTrackbar("UniquenessRatio:\n", "disparity_bm", &uniquenessRatio, 50, stereo_match, 0);
+	getTrackbarPos("blocksize:\n", "disparity_bm");
+	createTrackbar("blocksize:\n", "disparity_bm", &blockSize, 8, stereo_match, 0);
+	stereo_match(0, 0);
+	//鼠标响应函数setMouseCallback(窗口名称, 鼠标回调函数, 传给回调函数的参数，一般取0)
+	setMouseCallback("disparity_bm", onMouse1, 0);
+
+
+
+	///////////////////////////////SGBM算法得到视差图+Z轴位置//////////////////////////////
+	namedWindow("disparity_sgbm", CV_NORMAL);
+	//滑轨响应函数createTrackbar(滑轨名, 依附图像, 函数变量地址指针，最大变值,作用函数，一般取0)
+	getTrackbarPos("SADWindowSize:\n", "disparity_sgbm");
+	createTrackbar("SADWindowSize:\n", "disparity_sgbm", &SADWindowSize, 30, stereo_sgbm_match);
+	stereo_sgbm_match(0, 0);
+	//鼠标响应函数setMouseCallback(窗口名称, 鼠标回调函数, 传给回调函数的参数，一般取0)
+	setMouseCallback("disparity_sgbm", onMouse2, 0);
+
+
+	waitKey(0);
+	return 0;
+	}
