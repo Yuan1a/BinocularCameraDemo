@@ -1,0 +1,204 @@
+/////////////////////采用单目标定获得的畸变系数 和内参矩阵进行双目标定获得双目标定后的外参 内参 畸变系数///////////////////
+#include <opencv2/opencv.hpp>  
+#include <vector>  
+#include <string>  
+#include <algorithm>  
+#include <iostream>  
+#include <iterator>  
+#include <stdio.h>  
+#include <stdlib.h>  
+#include <ctype.h>  
+#include "cv.h"  
+#include <cv.hpp>  
+
+using namespace std;
+using namespace cv;                                
+
+
+const int imageWidth = 1920;                             //摄像头的分辨率  
+const int imageHeight = 1080;
+const int boardWidth = 6;                               //横向的角点数目  
+const int boardHeight = 4;                              //纵向的角点数据  
+const int boardCorner = boardWidth * boardHeight;       //总的角点数据  
+const int frameNumber = 4;                             //相机标定时需要采用的图像帧数  
+const int squareSize = 10;                              //标定板黑白格子的大小 单位mm  
+const Size boardSize = Size(boardWidth, boardHeight);   //标定板的总内角点  
+Size imageSize = Size(imageWidth, imageHeight);
+
+Mat R, T, E, F;                                                  //R 旋转矢量 T平移矢量 E本征矩阵 F基础矩阵  
+vector<Mat> rvecs;                                        //旋转向量  
+vector<Mat> tvecs;                                        //平移向量  
+vector<vector<Point2f>> imagePointL;                    //左边摄像机所有照片角点的坐标集合  
+vector<vector<Point2f>> imagePointR;                    //右边摄像机所有照片角点的坐标集合  
+vector<vector<Point3f>> objRealPoint;                   //各副图像的角点的实际物理坐标集合  
+
+vector<Point2f> cornerL;                              //左边摄像机某一照片角点坐标集合  
+
+vector<Point2f> cornerR;                              //右边摄像机某一照片角点坐标集合  
+
+Mat rgbImageL, grayImageL;
+Mat rgbImageR, grayImageR;
+
+Mat Rl, Rr, Pl, Pr, Q;                                  //校正旋转矩阵R，投影矩阵P 重投影矩阵Q (下面有具体的含义解释）   
+
+
+
+/*
+事先标定好的左相机的内参矩阵
+fx 0 cx
+0 fy cy
+0 0  1
+*/
+Mat cameraMatrixL = (Mat_<double>(3, 3) 
+	<< 3534.626983293153, 0, 980.6469238473449,
+0, 3550.415644570146, 574.5633697305435,
+0, 0, 1);                                                                           //把左右相机单目标定的参数给写上
+   //获得的畸变参数
+Mat distCoeffL = (Mat_<double>(5, 1)
+	<< 0.6270651060404676, -13.4494810364961, 0.007731807755781618, -0.01324373004184698, 120.505293418534);
+/*
+事先标定好的右相机的内参矩阵
+fx 0 cx
+0 fy cy
+0 0  1
+*/
+Mat cameraMatrixR = (Mat_<double>(3, 3) << 4423.464673161363, 0, 964.2729471207851,
+0, 4419.947377244172, 617.8340886875628,
+0, 0, 1);
+Mat distCoeffR = (Mat_<double>(1, 5) << 0.9262466661377545, -24.51704442755719, 0.008164713168244535, 0.02474603733905496, 265.6404204259018);
+
+/*计算标定板上模块的实际物理坐标*/
+void calRealPoint(vector<vector<Point3f>>& obj, int boardwidth, int boardheight, int imgNumber, int squaresize)
+{
+	vector<Point3f> imgpoint;
+	for (int rowIndex = 0; rowIndex < boardheight; rowIndex++)
+	{
+		for (int colIndex = 0; colIndex < boardwidth; colIndex++)
+		{
+			imgpoint.push_back(Point3f(rowIndex * squaresize, colIndex * squaresize, 0));
+		}
+	}
+	for (int imgIndex = 0; imgIndex < imgNumber; imgIndex++)
+	{
+		obj.push_back(imgpoint);
+	}
+}
+
+
+void outputCameraParam(void)
+{
+	/*保存数据*/
+	/*输出数据*/
+	FileStorage fs("intrinsics.yml", FileStorage::WRITE);  //文件存储器的初始化
+	if (fs.isOpened())
+	{
+		fs << "cameraMatrixL" << cameraMatrixL << "cameraDistcoeffL" << distCoeffL << "cameraMatrixR" << cameraMatrixR << "cameraDistcoeffR" << distCoeffR;
+		fs.release();
+		cout << "cameraMatrixL=:" << cameraMatrixL << endl << "cameraDistcoeffL=:" << distCoeffL << endl << "cameraMatrixR=:" << cameraMatrixR << endl << "cameraDistcoeffR=:" << distCoeffR << endl;
+	}
+	else
+	{
+		cout<< "Error: can not save the intrinsics!!!!!" << endl;
+	}
+
+
+	fs.open("extrinsics.yml", FileStorage::WRITE);
+	if (fs.isOpened())
+		{
+			fs << "R" << R << "T" << T << "Rl" << Rl << "Rr" << Rr << "Pl" << Pl << "Pr" << Pr << "Q" << Q;
+			cout<< "R=" << R << endl << "T=" << T << endl << "Rl=" << Rl << endl << "Rr" << Rr << endl << "Pl" << Pl << endl << "Pr" << Pr << endl << "Q" << Q << endl;
+			fs.release();
+	}
+	else
+		cout<< "Error: can not save the extrinsic parameters\n";
+}
+
+int main(int argc, char* argv[])
+{
+	Mat img;
+	int goodFrameCount = 0;
+	while (goodFrameCount < frameNumber) //通过while循环找到图片角点且判断质量
+	{
+		char filenameL[100];
+		char filenameR[100];
+		/*读取左边的图像*/
+		sprintf_s(filenameL, "E://PROJECT//BinocularCamera//BinocularCamera//left//left%d.BMP", goodFrameCount);
+		//string filenameL = format("E:/PROJECT/Twoeyes/twoeyes/left/left%d.BMP", goodFrameCount);//E:\PROJECT\Twoeyes\twoeyes\left
+		rgbImageL = imread(filenameL, IMREAD_UNCHANGED);
+		cvtColor(rgbImageL, grayImageL, CV_BGR2GRAY);
+
+		/*读取右边的图像*/
+		sprintf_s(filenameR, "E://PROJECT//BinocularCamera//BinocularCamera//right//right%d.BMP", goodFrameCount);
+		//string filenameR = format("E:\\PROJECT\\Twoeyes\\twoeyes\\right\\right%d.BMP", goodFrameCount);
+		rgbImageR = imread(filenameR, IMREAD_UNCHANGED);
+		cvtColor(rgbImageR, grayImageR, CV_BGR2GRAY);
+
+		bool isFindL, isFindR;
+
+		isFindL = findChessboardCorners(rgbImageL, boardSize, cornerL);
+		isFindR = findChessboardCorners(rgbImageR, boardSize, cornerR);
+		if (isFindL == true && isFindR == true)  //如果两幅图像都找到了所有的角点 则说明这两幅图像是可行的  
+		{
+			/*
+			Size(5,5) 搜索窗口的一半大小
+			Size(-1,-1) 死区的一半尺寸
+			TermCriteria(CV_TERMCRIT_EPS | CV_TERMCRIT_ITER, 20, 0.1)迭代终止条件
+			*/
+			//仅显示最后的两张图片
+			cornerSubPix(grayImageL, cornerL, Size(5, 5), Size(-1, -1), TermCriteria(CV_TERMCRIT_EPS | CV_TERMCRIT_ITER, 20, 0.1));
+			drawChessboardCorners(rgbImageL, boardSize, cornerL, isFindL);
+			namedWindow("chessboardL", CV_WINDOW_NORMAL);
+			imshow("chessboardL", rgbImageL);
+			imagePointL.push_back(cornerL);
+
+			cornerSubPix(grayImageR, cornerR, Size(5, 5), Size(-1, -1), TermCriteria(CV_TERMCRIT_EPS | CV_TERMCRIT_ITER, 20, 0.1));
+			drawChessboardCorners(rgbImageR, boardSize, cornerR, isFindR);
+			namedWindow("chessboardR", CV_WINDOW_NORMAL);
+			imshow("chessboardR", rgbImageR);
+			imagePointR.push_back(cornerR);
+
+
+			//string filename = "res\\image\\calibration";  
+			//filename += goodFrameCount + ".jpg";  
+			//cvSaveImage(filename.c_str(), &IplImage(rgbImage));       //把合格的图片保存起来  
+			cout << "The image" << goodFrameCount << " is good" << endl;
+		}
+		else
+		{
+			cout << "The image is bad please try again" << endl;
+		}
+		goodFrameCount++;
+
+		if (waitKey(10) == 'q')
+		{
+			break;
+		}
+
+	}
+
+	/*
+	计算实际的校正点的三维坐标
+	根据实际标定格子的大小来设置
+	*/
+	calRealPoint(objRealPoint, boardWidth, boardHeight, frameNumber, squareSize);
+	cout << "cal real successful" << endl;
+
+	/*
+	标定摄像头
+	由于左右摄像机分别都经过了单目标定
+	所以在此处选择flag = CALIB_USE_INTRINSIC_GUESS
+	*/
+	double rms = stereoCalibrate(objRealPoint, imagePointL, imagePointR,
+		cameraMatrixL, distCoeffL,
+		cameraMatrixR, distCoeffR,
+		Size(imageWidth, imageHeight), R, T, E, F, CALIB_USE_INTRINSIC_GUESS,
+		TermCriteria(TermCriteria::COUNT + TermCriteria::EPS, 100, 1e-5)); //需要注意，应该是版本的原因，该函数最后两个参数，我是调换过来后才显示不出错的
+
+	cout << "Stereo Calibration done with RMS error = " << rms << endl;//打印出双目修正过后的内参外参还有RT
+	cout << "calibration successful！" << endl;
+	//*保存并输出数据*/
+	outputCameraParam();
+	waitKey(0);
+	return 0;
+
+}
